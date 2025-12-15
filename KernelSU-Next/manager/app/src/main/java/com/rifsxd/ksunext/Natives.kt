@@ -75,6 +75,12 @@ object Natives {
     external fun getHookMode(): String?
 
     /**
+     * Get the version tag from the kernel.
+     * @return version tag, or null if unavailable.
+     */
+    external fun getVersionTag(): String?
+
+    /**
      * Check if Zygisk injection is enabled in the environment.
      */
     external fun isZygiskEnabled(): Boolean
