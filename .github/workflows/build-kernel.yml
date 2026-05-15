@@ -33,7 +33,7 @@ permissions:
   contents: read
 
 env:
-  KERNEL_REPO: yvikash18/android_kernel_google_msm-4.14
+  KERNEL_REPO: abu-adm/android_kernel_google_msm-4.14
   KERNEL_BRANCH: ${{ github.event.inputs.kernel_branch }}
   DEFCONFIG: sunfish_defconfig
   ARCH: arm64
