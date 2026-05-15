@@ -20,8 +20,19 @@ jobs:
         run: |
           sudo apt update
           sudo apt install -y bc bison build-essential ccache cpio curl wget \
-            flex git kmod libelf-dev libssl-dev lz4 python3 zip device-tree-compiler \
+            flex git kmod libelf-dev libssl-dev lz4 python3 zip \
             binutils-aarch64-linux-gnu
+          # Deliberately NOT installing device-tree-compiler — we use the in-tree dtc
+
+      - name: Remove any host dtc (force in-tree)
+        run: |
+          sudo apt remove -y device-tree-compiler 2>/dev/null || true
+          if command -v dtc >/dev/null 2>&1; then
+            sudo mv "$(command -v dtc)" "$(command -v dtc).bak"
+            echo "Moved host dtc out of PATH"
+          else
+            echo "No host dtc present (good)"
+          fi
 
       - name: Checkout kernel
         uses: actions/checkout@v4
@@ -33,7 +44,6 @@ jobs:
       - name: Fetch AOSP Clang (r530567 - LOS 23 default)
         run: |
           mkdir -p toolchain/clang
-          # Try the prebuilt tarballs in order of preference; first that works wins.
           CLANG_VERSIONS=(
             clang-r530567
             clang-r522817
@@ -54,14 +64,12 @@ jobs:
             rm -f clang.tar.gz
           done
 
-          # Fallback: shallow-clone AOSP master-kernel (huge but reliable)
           if [ "$SUCCESS" != "1" ]; then
             echo "Tarball method failed, falling back to git clone (slow)"
             rm -rf toolchain/clang
             git clone --depth=1 -b main-kernel \
               https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 \
               toolchain/clang-full
-            # Pick the newest clang-r* dir
             LATEST=$(ls -d toolchain/clang-full/clang-r* 2>/dev/null | sort -V | tail -1)
             if [ -n "$LATEST" ]; then
               mv "$LATEST" toolchain/clang
@@ -161,7 +169,17 @@ jobs:
           echo "=== Verify KSU/SUSFS landed in .config ==="
           grep -E 'CONFIG_(KSU|SUSFS|AUDITSYSCALL|UNMAP_KERNEL_AT_EL0|MITIGATE_SPECTRE|CC_WERROR|BPF_UNPRIV)' out/.config || true
 
-          make -j$(nproc) "${MAKE_ARGS[@]}" 2>&1 | tee build.log
+          # Build kernel image (independent of dtbo, which is broken)
+          echo "===================== Building Image.lz4 ====================="
+          make -j$(nproc) "${MAKE_ARGS[@]}" Image.lz4 2>&1 | tee build.log
+
+          # Build main dtbs (overlay dtbos may fail; non-fatal)
+          echo "===================== Building dtbs ====================="
+          make -j$(nproc) "${MAKE_ARGS[@]}" dtbs 2>&1 | tee -a build.log || \
+            echo "WARNING: dtbs/dtbo had errors — overlay files may be missing (kernel image still usable)"
+
+          echo "===================== Artifacts produced ====================="
+          find out/arch/arm64/boot -maxdepth 3 -type f \( -name 'Image*' -o -name '*.dtb' -o -name '*.dtbo' \) -ls
 
       - name: Verify KSU is actually in the kernel binary
         if: always()
@@ -186,6 +204,3 @@ jobs:
             kernel/build.log
           if-no-files-found: warn
           retention-days: 14
-
-
-          
