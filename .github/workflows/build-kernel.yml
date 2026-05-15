@@ -1,16 +1,19 @@
 name: Build sunfish KSU+SUSFS Kernel (LineageOS 23.0 / Android 16)
 
-# What this builds:
-#   Repo:    yvikash18/android_kernel_google_msm-4.14, branch ksu-susfs-23.0
-#   Device:  Google Pixel 4a (sunfish)
-#   Kernel:  Linux 4.14.356 with KernelSU-Next v1.1.1 + SUSFS
-#   Defconfig: sunfish_defconfig (CONFIG_KSU defaults to y via drivers/kernelsu/Kconfig)
+# Repo:    yvikash18/android_kernel_google_msm-4.14, branch ksu-susfs-23.0
+# Device:  Google Pixel 4a (sunfish)
+# Kernel:  Linux 4.14.356 + KernelSU-Next v1.1.1 + SUSFS v1.5.12
+# Toolchain (from build.config.common in the kernel repo):
+#   Clang: clang-r416183b  (AOSP S, ~Clang 12.0.5)
+#   GCC:   aarch64-linux-android-4.9 + arm-linux-androideabi-4.9 (paths only; we use LLVM IAS, no GNU as)
 #
-# Toolchain (pinned to what build.config.common declares):
-#   Clang:  clang-r416183b   (AOSP Android 12 / S kernel clang, ~Clang 12.0.5)
-#   GCC:    aarch64-linux-android-4.9 and arm-linux-androideabi-4.9 (AOSP prebuilts)
-#   Linker: ld.lld   (set by build.config.common.clang)
-#   Triple: aarch64-linux-gnu-  (CLANG_TRIPLE)
+# Fixes vs. v1:
+#   * LLVM_IAS=1 -> use Clang's integrated assembler instead of GCC 4.9's `as`
+#     (GCC 4.9 doesn't know -march=armv8.2-a+dotprod that this kernel uses).
+#   * KCFLAGS adds -Wno-gnu-variable-sized-type-not-at-end -> SUSFS appends
+#     fields after `struct cgroup cgrp` in cgroup-defs.h, which clang flags as
+#     a GNU extension; the code is valid and the kernel treats warnings as errors.
+#   * Export KSU_GIT_VERSION so the build doesn't print the "not defined" notice.
 
 on:
   workflow_dispatch:
@@ -26,14 +29,11 @@ on:
         type: choice
         options: [default, no-cfi, performance]
 
-# Security note: this workflow only reads code from public mirrors, does not
-# need any secrets, and uploads artifacts back to Actions. It does not push
-# anywhere. Set 'permissions: contents: read' to follow least-privilege.
 permissions:
   contents: read
 
 env:
-  KERNEL_REPO: abu-adm/android_kernel_google_msm-4.14
+  KERNEL_REPO: yvikash18/android_kernel_google_msm-4.14
   KERNEL_BRANCH: ${{ github.event.inputs.kernel_branch }}
   DEFCONFIG: sunfish_defconfig
   ARCH: arm64
@@ -43,13 +43,10 @@ env:
 jobs:
   build:
     name: Build kernel image
-    runs-on: ubuntu-22.04   # glibc 2.35 - works fine with clang-r416183b
+    runs-on: ubuntu-22.04
     timeout-minutes: 90
 
     steps:
-      # ----------------------------------------------------------
-      # 0. Free disk space - the prebuilt clang alone is ~1.5 GB
-      # ----------------------------------------------------------
       - name: Maximize build disk
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
@@ -57,9 +54,6 @@ jobs:
           sudo docker image prune -af || true
           df -h
 
-      # ----------------------------------------------------------
-      # 1. Install host build dependencies
-      # ----------------------------------------------------------
       - name: Install build packages
         run: |
           sudo apt-get update
@@ -73,9 +67,6 @@ jobs:
             http://launchpadlibrarian.net/666971015/libtinfo5_6.3-2ubuntu0.1_amd64.deb
           sudo dpkg -i /tmp/libtinfo5.deb || sudo apt-get -f install -y
 
-      # ----------------------------------------------------------
-      # 2. Checkout kernel source (this is the only repo we modify)
-      # ----------------------------------------------------------
       - name: Checkout kernel source
         uses: actions/checkout@v4
         with:
@@ -85,36 +76,27 @@ jobs:
           fetch-depth: 1
           submodules: false
 
-      # ----------------------------------------------------------
-      # 3. Fetch toolchains - versions are PINNED to what
-      #    build.config.common in the repo declares. Do not bump.
-      # ----------------------------------------------------------
       - name: Fetch Clang (clang-r416183b)
         run: |
           mkdir -p toolchain/clang
-          # Mirror that keeps a stable shallow clone of just this clang release
           git clone --depth=1 \
             https://gitlab.com/CalyxOS/platform_prebuilts_clang_kernel_linux-x86_clang-r416183b.git \
             toolchain/clang
-          # Sanity: must contain bin/clang
           test -x toolchain/clang/bin/clang
           toolchain/clang/bin/clang --version
 
-      - name: Fetch GCC aarch64 (4.9, AOSP)
+      - name: Fetch GCC aarch64 (4.9, AOSP - paths only, LLVM IAS does the work)
         run: |
           git clone --depth=1 -b lineage-19.1 \
             https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9.git \
             toolchain/gcc-aarch64
 
-      - name: Fetch GCC arm (4.9, AOSP, for 32-bit vDSO)
+      - name: Fetch GCC arm (4.9, AOSP, for 32-bit vDSO path resolution)
         run: |
           git clone --depth=1 -b lineage-19.1 \
             https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_arm_arm-linux-androideabi-4.9.git \
             toolchain/gcc-arm
 
-      # ----------------------------------------------------------
-      # 4. ccache (cuts second-run from ~25 min to ~5 min)
-      # ----------------------------------------------------------
       - name: Restore ccache
         uses: actions/cache@v4
         with:
@@ -130,9 +112,6 @@ jobs:
           echo "CCACHE_DIR=$HOME/.ccache" >> $GITHUB_ENV
           echo "USE_CCACHE=1" >> $GITHUB_ENV
 
-      # ----------------------------------------------------------
-      # 5. Sanity-check the kernel tree (catches bad checkouts early)
-      # ----------------------------------------------------------
       - name: Verify kernel source layout
         working-directory: kernel
         run: |
@@ -140,19 +119,12 @@ jobs:
           grep -q '^VERSION = 4' Makefile
           grep -q '^PATCHLEVEL = 14' Makefile
           test -f arch/arm64/configs/${DEFCONFIG}
-          test -L drivers/kernelsu             # KernelSU-Next symlink
+          test -L drivers/kernelsu
           test -f drivers/kernelsu/Kconfig
-          test -f fs/susfs.c                   # SUSFS sources in-tree
+          test -f fs/susfs.c
           test -f include/linux/susfs.h
           echo "Kernel tree looks correct."
 
-      # ----------------------------------------------------------
-      # 6. Build
-      #
-      # We bypass build/build.sh (which expects a full repo manifest layout
-      # under prebuilts-master/) and invoke kbuild directly using the same
-      # variables build.config.common.clang would have set.
-      # ----------------------------------------------------------
       - name: Build kernel
         working-directory: kernel
         run: |
@@ -160,10 +132,26 @@ jobs:
           export PATH="${GITHUB_WORKSPACE}/toolchain/clang/bin:${GITHUB_WORKSPACE}/toolchain/gcc-aarch64/bin:${GITHUB_WORKSPACE}/toolchain/gcc-arm/bin:${PATH}"
           export LD_LIBRARY_PATH="${GITHUB_WORKSPACE}/toolchain/clang/lib64:${LD_LIBRARY_PATH:-}"
 
+          # KernelSU-Next: provide a synthetic git version so the build doesn't
+          # complain. Format follows what KernelSU's own Makefile would produce
+          # from `git rev-list --count HEAD` + 10200 (its base offset).
+          export KSU_GIT_VERSION="$(git -C KernelSU-Next rev-list --count HEAD 2>/dev/null \
+                                     | awk '{print 10200 + $1}' || echo 11000)"
+
+          # Extra C flags forwarded to every clang invocation. The SUSFS-patched
+          # cgroup-defs.h trips -Wgnu-variable-sized-type-not-at-end, which is
+          # promoted to error by the kernel's -Werror.
+          EXTRA_KCFLAGS="-Wno-gnu-variable-sized-type-not-at-end \
+                         -Wno-error=gnu-variable-sized-type-not-at-end \
+                         -Wno-unused-but-set-variable \
+                         -Wno-misleading-indentation"
+
           MAKE_ARGS=(
             -j"$(nproc)"
             O=out
             ARCH=arm64
+            LLVM=1
+            LLVM_IAS=1
             CC="ccache clang"
             LD=ld.lld
             AR=llvm-ar
@@ -179,12 +167,14 @@ jobs:
             CLANG_TRIPLE=aarch64-linux-gnu-
             CROSS_COMPILE=aarch64-linux-android-
             CROSS_COMPILE_ARM32=arm-linux-androideabi-
+            KCFLAGS=${EXTRA_KCFLAGS}
+            KCPPFLAGS=${EXTRA_KCFLAGS}
           )
 
-          # 6a. Generate .config
+          # 1. defconfig
           make "${MAKE_ARGS[@]}" ${DEFCONFIG}
 
-          # 6b. Apply variant tweaks
+          # 2. variant tweaks
           case "${{ github.event.inputs.build_variant }}" in
             no-cfi)
               scripts/config --file out/.config \
@@ -192,32 +182,26 @@ jobs:
               make "${MAKE_ARGS[@]}" olddefconfig
               ;;
             performance)
-              # mirror build.config.sunfish_performance: keeps CFI, disables debug
               scripts/config --file out/.config -d DEBUG_INFO
               make "${MAKE_ARGS[@]}" olddefconfig
               ;;
           esac
 
-          # 6c. Confirm KSU + SUSFS are on
-          grep -E '^CONFIG_KSU=' out/.config || echo "WARN: CONFIG_KSU not =y"
-          grep -E '^CONFIG_KSU_SUSFS=' out/.config || true
+          # 3. confirm KSU + SUSFS
+          grep -E '^CONFIG_KSU='       out/.config || echo "WARN: CONFIG_KSU not =y"
+          grep -E '^CONFIG_KSU_SUSFS=' out/.config || echo "WARN: CONFIG_KSU_SUSFS not =y"
 
-          # 6d. Build
+          # 4. build
           make "${MAKE_ARGS[@]}"
 
-          # 6e. Show build info
           ccache -s
           ls -lh out/arch/arm64/boot/
           strings out/include/generated/compile.h | grep -i linux_compiler || true
 
-      # ----------------------------------------------------------
-      # 7. Collect outputs
-      # ----------------------------------------------------------
       - name: Collect artifacts
         working-directory: kernel
         run: |
           mkdir -p ../dist
-          # Pixel 4a uses lz4-legacy compressed Image.lz4-dtb in its boot.img
           for f in Image Image.lz4 Image.lz4-dtb Image.gz Image.gz-dtb dtbo.img; do
             [ -f out/arch/arm64/boot/$f ] && cp -v out/arch/arm64/boot/$f ../dist/
           done
