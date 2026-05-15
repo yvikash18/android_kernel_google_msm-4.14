@@ -19,7 +19,7 @@ jobs:
       - name: Install deps
         run: |
           sudo apt update
-          sudo apt install -y bc bison build-essential ccache cpio curl \
+          sudo apt install -y bc bison build-essential ccache cpio curl wget \
             flex git kmod libelf-dev libssl-dev lz4 python3 zip device-tree-compiler \
             binutils-aarch64-linux-gnu
 
@@ -30,35 +30,66 @@ jobs:
           ref: ksu-susfs-23.0
           path: kernel
 
-      - name: Fetch LineageOS Clang (with branch fallback)
+      - name: Fetch AOSP Clang (r530567 - LOS 23 default)
         run: |
-          mkdir -p toolchain
-          for branch in lineage-23.0 lineage-22.2 lineage-22.1 lineage-21.0 main master; do
-            if git clone --depth=1 -b "$branch" \
-              https://github.com/LineageOS/android_prebuilts_clang_kernel_linux-x86_clang-android.git \
-              toolchain/clang 2>/dev/null; then
-              echo "Cloned Clang branch: $branch"
-              break
+          mkdir -p toolchain/clang
+          # Try the prebuilt tarballs in order of preference; first that works wins.
+          CLANG_VERSIONS=(
+            clang-r530567
+            clang-r522817
+            clang-r510928
+          )
+          SUCCESS=0
+          for ver in "${CLANG_VERSIONS[@]}"; do
+            URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main-kernel/${ver}.tar.gz"
+            echo "Trying ${URL}"
+            if wget -q --tries=2 --timeout=30 "${URL}" -O clang.tar.gz && [ -s clang.tar.gz ]; then
+              if tar -xzf clang.tar.gz -C toolchain/clang 2>/dev/null && [ -x toolchain/clang/bin/clang ]; then
+                echo "Got ${ver}"
+                SUCCESS=1
+                rm clang.tar.gz
+                break
+              fi
             fi
+            rm -f clang.tar.gz
           done
-          test -x toolchain/clang/bin/clang || { echo "ERROR: No clang prebuilt found"; exit 1; }
+
+          # Fallback: shallow-clone AOSP master-kernel (huge but reliable)
+          if [ "$SUCCESS" != "1" ]; then
+            echo "Tarball method failed, falling back to git clone (slow)"
+            rm -rf toolchain/clang
+            git clone --depth=1 -b main-kernel \
+              https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 \
+              toolchain/clang-full
+            # Pick the newest clang-r* dir
+            LATEST=$(ls -d toolchain/clang-full/clang-r* 2>/dev/null | sort -V | tail -1)
+            if [ -n "$LATEST" ]; then
+              mv "$LATEST" toolchain/clang
+              rm -rf toolchain/clang-full
+            else
+              echo "ERROR: no clang-r* directory found"
+              exit 1
+            fi
+          fi
+
+          test -x toolchain/clang/bin/clang || { echo "ERROR: clang binary missing"; ls -la toolchain/clang/bin/ 2>/dev/null; exit 1; }
           toolchain/clang/bin/clang --version
 
       - name: Fetch GCC stubs (for CROSS_COMPILE triplet)
         run: |
-          for branch in lineage-23.0 lineage-22.2 lineage-22.1 lineage-21.0 lineage-19.1; do
+          for branch in lineage-22.2 lineage-22.1 lineage-21.0 lineage-19.1; do
             if git clone --depth=1 -b "$branch" \
               https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9.git \
               toolchain/aarch64 2>/dev/null; then
-              echo "Cloned aarch64 GCC branch: $branch"
+              echo "aarch64 GCC: $branch"
               break
             fi
           done
-          for branch in lineage-23.0 lineage-22.2 lineage-22.1 lineage-21.0 lineage-19.1; do
+          for branch in lineage-22.2 lineage-22.1 lineage-21.0 lineage-19.1; do
             if git clone --depth=1 -b "$branch" \
               https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_arm_arm-linux-androideabi-4.9.git \
               toolchain/arm 2>/dev/null; then
-              echo "Cloned arm GCC branch: $branch"
+              echo "arm GCC: $branch"
               break
             fi
           done
@@ -88,7 +119,7 @@ jobs:
           CONFIG_UNMAP_KERNEL_AT_EL0=y
           CONFIG_MITIGATE_SPECTRE_BRANCH_HISTORY=y
           CONFIG_BPF_UNPRIV_DEFAULT_OFF=y
-          # --- Disable Werror so newer Clang's stricter warnings don't kill the build ---
+          # --- Disable Werror for newer Clang's stricter warnings ---
           # CONFIG_CC_WERROR is not set
           EOF
           sed -i 's/^          //' kernel/arch/arm64/configs/sunfish_defconfig
@@ -99,7 +130,7 @@ jobs:
         run: |
           cd kernel
           export PATH="$GITHUB_WORKSPACE/toolchain/clang/bin:$GITHUB_WORKSPACE/toolchain/aarch64/bin:$GITHUB_WORKSPACE/toolchain/arm/bin:$PATH"
-          export LD_LIBRARY_PATH="$GITHUB_WORKSPACE/toolchain/clang/lib:$LD_LIBRARY_PATH"
+          export LD_LIBRARY_PATH="$GITHUB_WORKSPACE/toolchain/clang/lib:$GITHUB_WORKSPACE/toolchain/clang/lib64:$LD_LIBRARY_PATH"
           export KBUILD_BUILD_USER=builder
           export KBUILD_BUILD_HOST=github-actions
 
@@ -133,12 +164,15 @@ jobs:
           make -j$(nproc) "${MAKE_ARGS[@]}" 2>&1 | tee build.log
 
       - name: Verify KSU is actually in the kernel binary
+        if: always()
         run: |
           cd kernel
-          echo "=== Strings check ==="
-          strings out/arch/arm64/boot/Image 2>/dev/null | grep -iE 'ksu|susfs' | head -20 || \
-            strings out/arch/arm64/boot/Image.gz 2>/dev/null | grep -iE 'ksu|susfs' | head -20 || \
-            echo "WARNING: no KSU/SusFS strings found"
+          for f in out/arch/arm64/boot/Image out/arch/arm64/boot/Image.lz4 out/arch/arm64/boot/Image.gz; do
+            if [ -f "$f" ]; then
+              echo "=== Strings in $f ==="
+              strings "$f" 2>/dev/null | grep -iE 'ksu|susfs' | head -20 || true
+            fi
+          done
 
       - name: Upload artifacts
         if: always()
@@ -152,3 +186,6 @@ jobs:
             kernel/build.log
           if-no-files-found: warn
           retention-days: 14
+
+
+          
