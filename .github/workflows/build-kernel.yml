@@ -12,14 +12,16 @@ jobs:
           android: false
           dotnet: true
           haskell: true
-          large-packages: true
-          swap-storage: true
+          large-packages: false
+          docker-images: true
+          swap-storage: false
 
       - name: Install deps
         run: |
           sudo apt update
           sudo apt install -y bc bison build-essential ccache cpio curl \
-            flex git kmod libelf-dev libssl-dev lz4 python3 zip device-tree-compiler
+            flex git kmod libelf-dev libssl-dev lz4 python3 zip device-tree-compiler \
+            binutils-aarch64-linux-gnu
 
       - name: Checkout kernel
         uses: actions/checkout@v4
@@ -28,19 +30,38 @@ jobs:
           ref: ksu-susfs-23.0
           path: kernel
 
-      - name: Fetch Neutron Clang
+      - name: Fetch LineageOS Clang (with branch fallback)
         run: |
-          mkdir -p toolchain/clang && cd toolchain/clang
-          bash <(curl -s "https://raw.githubusercontent.com/Neutron-Toolchains/antman/main/antman") -S
+          mkdir -p toolchain
+          for branch in lineage-23.0 lineage-22.2 lineage-22.1 lineage-21.0 main master; do
+            if git clone --depth=1 -b "$branch" \
+              https://github.com/LineageOS/android_prebuilts_clang_kernel_linux-x86_clang-android.git \
+              toolchain/clang 2>/dev/null; then
+              echo "Cloned Clang branch: $branch"
+              break
+            fi
+          done
+          test -x toolchain/clang/bin/clang || { echo "ERROR: No clang prebuilt found"; exit 1; }
+          toolchain/clang/bin/clang --version
 
-      - name: Fetch GCC (aarch64 + arm)
+      - name: Fetch GCC stubs (for CROSS_COMPILE triplet)
         run: |
-          git clone --depth=1 -b lineage-19.1 \
-            https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9 \
-            toolchain/aarch64
-          git clone --depth=1 -b lineage-19.1 \
-            https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_arm_arm-linux-androideabi-4.9 \
-            toolchain/arm
+          for branch in lineage-23.0 lineage-22.2 lineage-22.1 lineage-21.0 lineage-19.1; do
+            if git clone --depth=1 -b "$branch" \
+              https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9.git \
+              toolchain/aarch64 2>/dev/null; then
+              echo "Cloned aarch64 GCC branch: $branch"
+              break
+            fi
+          done
+          for branch in lineage-23.0 lineage-22.2 lineage-22.1 lineage-21.0 lineage-19.1; do
+            if git clone --depth=1 -b "$branch" \
+              https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_arm_arm-linux-androideabi-4.9.git \
+              toolchain/arm 2>/dev/null; then
+              echo "Cloned arm GCC branch: $branch"
+              break
+            fi
+          done
 
       - name: Patch defconfig (KSU + SusFS + hardening)
         run: |
@@ -62,40 +83,65 @@ jobs:
           CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
           CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y
           CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
-          # --- Security hardening (recommended) ---
+          # --- Security hardening ---
           CONFIG_AUDITSYSCALL=y
           CONFIG_UNMAP_KERNEL_AT_EL0=y
           CONFIG_MITIGATE_SPECTRE_BRANCH_HISTORY=y
           CONFIG_BPF_UNPRIV_DEFAULT_OFF=y
+          # --- Disable Werror so newer Clang's stricter warnings don't kill the build ---
+          # CONFIG_CC_WERROR is not set
           EOF
-          # Strip leading whitespace that YAML indentation introduced
           sed -i 's/^          //' kernel/arch/arm64/configs/sunfish_defconfig
-          echo "=== Last 30 lines of patched defconfig ==="
-          tail -30 kernel/arch/arm64/configs/sunfish_defconfig
+          echo "=== Last 40 lines of patched defconfig ==="
+          tail -40 kernel/arch/arm64/configs/sunfish_defconfig
 
       - name: Build
         run: |
           cd kernel
           export PATH="$GITHUB_WORKSPACE/toolchain/clang/bin:$GITHUB_WORKSPACE/toolchain/aarch64/bin:$GITHUB_WORKSPACE/toolchain/arm/bin:$PATH"
+          export LD_LIBRARY_PATH="$GITHUB_WORKSPACE/toolchain/clang/lib:$LD_LIBRARY_PATH"
           export KBUILD_BUILD_USER=builder
           export KBUILD_BUILD_HOST=github-actions
-          make O=out ARCH=arm64 sunfish_defconfig
-          echo "=== Verify KSU/SUSFS landed in .config ==="
-          grep -E 'CONFIG_(KSU|SUSFS|AUDITSYSCALL|UNMAP_KERNEL_AT_EL0|MITIGATE_SPECTRE)' out/.config || true
-          make -j$(nproc) O=out ARCH=arm64 \
-            CC=clang LD=ld.lld AR=llvm-ar NM=llvm-nm \
-            OBJCOPY=llvm-objcopy STRIP=llvm-strip OBJDUMP=llvm-objdump \
-            CROSS_COMPILE=aarch64-linux-android- \
-            CROSS_COMPILE_ARM32=arm-linux-androideabi- \
+
+          MAKE_ARGS=(
+            O=out
+            ARCH=arm64
+            LLVM=1
+            LLVM_IAS=1
+            CC=clang
+            LD=ld.lld
+            AR=llvm-ar
+            NM=llvm-nm
+            OBJCOPY=llvm-objcopy
+            STRIP=llvm-strip
+            OBJDUMP=llvm-objdump
+            READELF=llvm-readelf
+            HOSTCC=clang
+            HOSTCXX=clang++
+            HOSTLD=ld.lld
+            CROSS_COMPILE=aarch64-linux-android-
+            CROSS_COMPILE_ARM32=arm-linux-androideabi-
             CLANG_TRIPLE=aarch64-linux-gnu-
+            KCFLAGS=-Wno-error
+          )
+
+          make "${MAKE_ARGS[@]}" sunfish_defconfig
+
+          echo "=== Verify KSU/SUSFS landed in .config ==="
+          grep -E 'CONFIG_(KSU|SUSFS|AUDITSYSCALL|UNMAP_KERNEL_AT_EL0|MITIGATE_SPECTRE|CC_WERROR|BPF_UNPRIV)' out/.config || true
+
+          make -j$(nproc) "${MAKE_ARGS[@]}" 2>&1 | tee build.log
 
       - name: Verify KSU is actually in the kernel binary
         run: |
           cd kernel
           echo "=== Strings check ==="
-          strings out/arch/arm64/boot/Image | grep -iE 'ksu|susfs' | head -20 || echo "WARNING: no KSU/SusFS strings found"
+          strings out/arch/arm64/boot/Image 2>/dev/null | grep -iE 'ksu|susfs' | head -20 || \
+            strings out/arch/arm64/boot/Image.gz 2>/dev/null | grep -iE 'ksu|susfs' | head -20 || \
+            echo "WARNING: no KSU/SusFS strings found"
 
       - name: Upload artifacts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: kernel-out
@@ -103,5 +149,6 @@ jobs:
             kernel/out/arch/arm64/boot/Image*
             kernel/out/arch/arm64/boot/dts/google/*.dtb
             kernel/out/arch/arm64/boot/dts/google/*.dtbo
+            kernel/build.log
           if-no-files-found: warn
           retention-days: 14
