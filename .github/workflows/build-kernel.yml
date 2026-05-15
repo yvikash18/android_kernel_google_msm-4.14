@@ -1,0 +1,107 @@
+name: Build sunfish kernel
+on: [push, workflow_dispatch]
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: false
+          dotnet: true
+          haskell: true
+          large-packages: true
+          swap-storage: true
+
+      - name: Install deps
+        run: |
+          sudo apt update
+          sudo apt install -y bc bison build-essential ccache cpio curl \
+            flex git kmod libelf-dev libssl-dev lz4 python3 zip device-tree-compiler
+
+      - name: Checkout kernel
+        uses: actions/checkout@v4
+        with:
+          repository: abu-adm/android_kernel_google_msm-4.14
+          ref: ksu-susfs-23.0
+          path: kernel
+
+      - name: Fetch Neutron Clang
+        run: |
+          mkdir -p toolchain/clang && cd toolchain/clang
+          bash <(curl -s "https://raw.githubusercontent.com/Neutron-Toolchains/antman/main/antman") -S
+
+      - name: Fetch GCC (aarch64 + arm)
+        run: |
+          git clone --depth=1 -b lineage-19.1 \
+            https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9 \
+            toolchain/aarch64
+          git clone --depth=1 -b lineage-19.1 \
+            https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_arm_arm-linux-androideabi-4.9 \
+            toolchain/arm
+
+      - name: Patch defconfig (KSU + SusFS + hardening)
+        run: |
+          tee -a kernel/arch/arm64/configs/sunfish_defconfig > /dev/null <<'EOF'
+          # --- KernelSU (manual hooks, no kprobes) ---
+          CONFIG_KSU=y
+          CONFIG_KSU_MANUAL_HOOK=y
+          # --- SusFS ---
+          CONFIG_KSU_SUSFS=y
+          CONFIG_KSU_SUSFS_SUS_PATH=y
+          CONFIG_KSU_SUSFS_SUS_MOUNT=y
+          CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y
+          CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y
+          CONFIG_KSU_SUSFS_SUS_KSTAT=y
+          CONFIG_KSU_SUSFS_TRY_UMOUNT=y
+          CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT=y
+          CONFIG_KSU_SUSFS_SPOOF_UNAME=y
+          CONFIG_KSU_SUSFS_ENABLE_LOG=y
+          CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
+          CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y
+          CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
+          # --- Security hardening (recommended) ---
+          CONFIG_AUDITSYSCALL=y
+          CONFIG_UNMAP_KERNEL_AT_EL0=y
+          CONFIG_MITIGATE_SPECTRE_BRANCH_HISTORY=y
+          CONFIG_BPF_UNPRIV_DEFAULT_OFF=y
+          EOF
+          # Strip leading whitespace that YAML indentation introduced
+          sed -i 's/^          //' kernel/arch/arm64/configs/sunfish_defconfig
+          echo "=== Last 30 lines of patched defconfig ==="
+          tail -30 kernel/arch/arm64/configs/sunfish_defconfig
+
+      - name: Build
+        run: |
+          cd kernel
+          export PATH="$GITHUB_WORKSPACE/toolchain/clang/bin:$GITHUB_WORKSPACE/toolchain/aarch64/bin:$GITHUB_WORKSPACE/toolchain/arm/bin:$PATH"
+          export KBUILD_BUILD_USER=builder
+          export KBUILD_BUILD_HOST=github-actions
+          make O=out ARCH=arm64 sunfish_defconfig
+          echo "=== Verify KSU/SUSFS landed in .config ==="
+          grep -E 'CONFIG_(KSU|SUSFS|AUDITSYSCALL|UNMAP_KERNEL_AT_EL0|MITIGATE_SPECTRE)' out/.config || true
+          make -j$(nproc) O=out ARCH=arm64 \
+            CC=clang LD=ld.lld AR=llvm-ar NM=llvm-nm \
+            OBJCOPY=llvm-objcopy STRIP=llvm-strip OBJDUMP=llvm-objdump \
+            CROSS_COMPILE=aarch64-linux-android- \
+            CROSS_COMPILE_ARM32=arm-linux-androideabi- \
+            CLANG_TRIPLE=aarch64-linux-gnu-
+
+      - name: Verify KSU is actually in the kernel binary
+        run: |
+          cd kernel
+          echo "=== Strings check ==="
+          strings out/arch/arm64/boot/Image | grep -iE 'ksu|susfs' | head -20 || echo "WARNING: no KSU/SusFS strings found"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-out
+          path: |
+            kernel/out/arch/arm64/boot/Image*
+            kernel/out/arch/arm64/boot/dts/google/*.dtb
+            kernel/out/arch/arm64/boot/dts/google/*.dtbo
+          if-no-files-found: warn
+          retention-days: 14
